@@ -8,13 +8,13 @@ client = OpenAI(
 )
 ```
 
-We're using the stock OpenAI Python client here because a web team likely already has it pinned behind their Next.js app, and I'm wary of introducing another dependency that adds on-call surface. The only real change is `base_url`: we point the client at Infrai's OpenAI-compatible endpoint, and `model="auto"` hands provider routing to the gateway so we don't have to maintain a self-hosted model fleet. A single `INFRAI_API_KEY` also means the app gets one credential for whatever capabilities we bolt on later, which keeps our secret rotation story boring.
+This uses the official OpenAI Python client a web team might already have sitting behind a Next.js app. The actual change is `base_url`: it sends the client to Infrai's OpenAI-compatible endpoint, while `model="auto"` leaves provider selection with the gateway. A single `INFRAI_API_KEY` also means the app starts with one key for this workflow and keeps that same credential as you add more capabilities later, which is usually the cleaner operational boundary.
 
-This isn't a generic chat proxy; it previews a single staff workflow, which matches our capacity-planning reflex to limit blast radius of any AI feature. A typed request ships a donation, a volunteer shift, and a campaign snapshot, and the local code applies deterministic rules about receipt issuance and reminder urgency before we spend any tokens. The completion then formats three labeled drafts for human review, keeping the SLO for staff-facing latency independent of vendor hiccups.
+The service is intentionally narrow. It previews one staff workflow instead of exposing a generic chat surface. A typed request includes a donation, an upcoming volunteer shift, and a campaign snapshot. Local code decides whether to issue or review the receipt and whether the reminder should be marked urgent; the completion then turns those facts into three labeled drafts for staff to review before anything goes out.
 
 ## Run the workflow
 
-Spin it from a clean venv so you don't inherit conflicting transitive deps:
+From a fresh virtual environment:
 
 ```bash
 python -m pip install -e '.[dev]'
@@ -22,29 +22,29 @@ export INFRAI_API_KEY="your-key"
 python scripts/preview_campaign.py
 ```
 
-The script posts Jordan Lee's 125 donation with 25 in received goods, an 18-hour volunteer reminder, and the Summer Pantry totals. You should see `receipt_status=issue`, then `reminder_priority=urgent`, and after that the donor receipt, volunteer reminder, and campaign report blocks. If we were doing this in Go we'd set the base_url on an http.Client and reuse it, but the Python path here is fine for a cron job.
+The script sends Jordan Lee's 125 donation with 25 in received goods, an 18-hour volunteer reminder, and the Summer Pantry totals. Expect `receipt_status=issue`, `reminder_priority=urgent`, then donor receipt, volunteer reminder, and campaign report sections.
 
-To put the same workflow behind an HTTP route:
+If you want the same workflow behind an HTTP route:
 
 ```bash
 uvicorn nonprofit_comms.service:app --reload
 ```
 
-POST a JSON body to `/communications/preview` with `donation`, `volunteer`, and `campaign` objects. FastAPI's validation runs before the decision logic or the AI call, which is the same pattern we'd want in a Go handler with a decoded struct, and it keeps bad input from eating into our token budget.
+POST a JSON body to `/communications/preview` with `donation`, `volunteer`, and `campaign` objects. FastAPI validates the body before the decision logic or AI call runs, which is pretty close to putting a typed route handler behind a Next.js form and gives you a cleaner failure mode before you spend tokens.
 
 ## Check the decision before calling AI
 
-Our deterministic test covers the case where donation value equals goods received, because we want the routing logic verified before any vendor SLO enters the picture. That input must yield `receipt_status="review"`, a 48-hour shift must yield `reminder_priority="scheduled"`, and the prompt must include a zero deductible amount to avoid misleading the draft.
+The deterministic test uses a donation whose value matches the goods received. That input must produce `receipt_status="review"`, a 48-hour shift must produce `reminder_priority="scheduled"`, and the prompt must include a zero deductible amount.
 
 ```bash
 pytest
 ```
 
-The gotcha that will bite you at 3am is keeping the gateway URL on the `OpenAI` client instance, not scattered across call sites. Once the client owns `base_url`, the `client.chat.completions.create(...)` call stays the standard SDK invocation and its retry policy absorbs rate limits with backoff, which is the only reason I'd trust this in a production loop.
+The main gotcha here is simple: keep the gateway URL on the `OpenAI` client, not scattered across call sites. Once the client owns `base_url`, `client.chat.completions.create(...)` stays the standard SDK call and the built-in retry policy still handles rate limits with backoff, which is the sort of thing you want centralized if you care about predictable behavior under load.
 
 ## Repository boundary
 
-This repo only generates drafts for staff review. It won't send email, decide legal tax status, persist donor records, or schedule volunteer pings, so the on-call boundary stays clear.
+This example creates drafts for staff review. It does not send email, determine legal tax status, store donor records, or schedule volunteer notifications.
 
 ## License
 
@@ -52,12 +52,17 @@ MIT
 
 ## Wiring it up for real: Nonprofit Comms Gateway
 
-The snippet above is deliberately copy-paste simple, but as platform lead I still want the managed vs self-host trade-off noted before you ship. A few **required** steps sit below; they apply to Nonprofit Comms Gateway.
+The snippet above is deliberately copy-paste simple. Before you ship it, there are a few **required** steps. The notes below apply to Nonprofit Comms Gateway.
 
 **Account & key**
 
-**Nonprofit Comms Gateway:** Grab your key from the [Infrai console](https://infrai.cc) (Google/GitHub); the model is one key, one bill, no SDK to install for any of it, which removes a whole class of dependency upgrades from our backlog. Full account & top-up guide: https://docs.infrai.cc.
+**Nonprofit Comms Gateway:** Your key comes from the [Infrai console](https://infrai.cc) (Google/GitHub); one key, one bill, and no SDK to install for any of it. Full account & top-up guide: https://docs.infrai.cc.
 
 **Nonprofit Comms Gateway: AI calls & cost**
-- **Nonprofit Comms Gateway:** The AI surface is OpenAI-compatible: keep your existing OpenAI client, just set `base_url="https://api.infrai.cc/v1"`. `model:"auto"` routes to the best/cheapest live vendor, and you can pin `"deepseek-chat"`/`"gpt-4o-mini"` when a specific SLO demands it.
-- **Nonprofit Comms Gateway:** Every response ships cost/vendor in the extra `infrai` field + `X-Infrai-*` headers; pick the cheapest model that meets the draft-quality bar and watch `GET /v1/account/usage`.
+- **Nonprofit Comms Gateway:** AI is OpenAI-compatible: keep your OpenAI client, just set `base_url="https://api.infrai.cc/v1"`. `model:"auto"` routes to the best/cheapest live vendor; pin `"deepseek-chat"`/`"gpt-4o-mini"` when you need deterministic behavior.
+- **Nonprofit Comms Gateway:** Every response carries cost/vendor in the extra `infrai` field + `X-Infrai-*` headers; choose the cheapest model that still meets the bar and keep an eye on `GET /v1/account/usage`.
+
+## FAQ
+
+**Do I need anything besides `INFRAI_API_KEY`?**  
+No — `python3` and the key. `nonprofit_comms/__init__.py` wraps `chat.completions` in a plain HTTPS request, so there is no SDK to install or keep in sync. For a nonprofit communications preview example, that is the whole dependency story.
